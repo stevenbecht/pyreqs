@@ -24,6 +24,170 @@ missing_packages = {}
 # Store license information for packages
 license_info = {}
 
+# Store flags for packages that need further investigation
+investigation_flags = {}
+
+def needs_investigation(package_data):
+    """Determine if a package needs further investigation for non-Python deps.
+    Only flags packages that definitively require native dependencies in a standard CPython environment.
+    """
+    info = package_data.get("info", {})
+    flags = []
+    confidence = 0  # Tracking confidence level of our detection
+    
+    # Check for extension module indicators in keywords
+    keywords = info.get("keywords", "")
+    if isinstance(keywords, list):
+        keywords = " ".join(keywords)
+    elif keywords is None:
+        keywords = ""
+        
+    keyword_indicators = ["c-extension", "rust", "cython", "ffi", "native"]
+    if any(ext in keywords.lower() for ext in keyword_indicators):
+        flags.append("Contains extension module keywords")
+        confidence += 2
+    
+    # Check package classifiers - strong indicators
+    classifiers = info.get("classifiers", []) or []
+    
+    # These classifiers definitively indicate native code
+    strong_classifiers = [
+        "Programming Language :: C",
+        "Programming Language :: C++",
+        "Programming Language :: Rust",
+        "Programming Language :: Cython",
+        "Topic :: Software Development :: Libraries :: Python Modules :: Foreign Function Interface"
+    ]
+    for classifier in classifiers:
+        if any(term in classifier for term in strong_classifiers):
+            flags.append(f"Uses native code: {classifier}")
+            confidence += 3
+    
+    # Check for common FFI build dependencies that are DIRECT (not conditional)
+    requires_dist = info.get("requires_dist", []) or []
+    
+    ffi_packages = ["cython", "cffi", "pybind11", "rust", "maturin", "setuptools-rust", "cmake"]
+    critical_ffi = ["cffi", "rust", "cython", "pybind11"]
+    
+    for req in requires_dist:
+        req_lower = req.lower()
+        
+        # Only count dependencies if they're DIRECT and unconditional
+        if ";" not in req_lower and "extra ==" not in req_lower:
+            for pkg in ffi_packages:
+                if pkg in req_lower:
+                    flags.append(f"Direct FFI dependency: {req}")
+                    confidence += 3
+                    # Critical FFIs get even more confidence
+                    if any(crit in req_lower for crit in critical_ffi):
+                        confidence += 1
+    
+    # Check if package has binaries/wheels with compiled code
+    # Look at the available files for .so, .pyd, or non-pure Python wheels
+    is_pure_python = True
+    release_info = package_data.get("urls", []) or []
+    wheel_types = set()
+    has_platform_specific_wheels = False
+    
+    for release in release_info:
+        filename = release.get("filename", "").lower()
+        
+        # Check for C extension module markers in filenames
+        if any(ext in filename for ext in [".so", ".pyd", ".dll"]):
+            is_pure_python = False
+            flags.append("Contains compiled extension modules")
+            confidence += 5
+            break
+            
+        # Analyze wheel types in detail
+        if filename.endswith(".whl"):
+            # Parse wheel filename components
+            try:
+                # Remove .whl extension and split by '-'
+                wheel_parts = filename[:-4].split('-')
+                if len(wheel_parts) >= 3:
+                    # Last three components are python tag, abi tag, platform tag
+                    python_tag = wheel_parts[-3]
+                    abi_tag = wheel_parts[-2]
+                    platform_tag = wheel_parts[-1]
+                    
+                    # Pure Python wheels have 'none' abi and 'any' platform
+                    if abi_tag == 'none' and platform_tag == 'any':
+                        wheel_types.add("pure-python")
+                    # ABI3 wheels are compatible with multiple Python versions
+                    elif 'abi3' in abi_tag:
+                        wheel_types.add("abi3")
+                        has_platform_specific_wheels = True
+                    # CPython specific ABI wheels
+                    elif python_tag.startswith('cp') and abi_tag.startswith('cp'):
+                        wheel_types.add("cpython-abi")
+                        has_platform_specific_wheels = True
+                    # Other platform-specific wheels
+                    elif platform_tag != 'any':
+                        wheel_types.add("platform-specific")
+                        has_platform_specific_wheels = True
+            except:
+                # If parsing fails, fall back to simple check
+                if "py3-none-any" not in filename:
+                    has_platform_specific_wheels = True
+    
+    # Add appropriate flags based on wheel analysis
+    if has_platform_specific_wheels:
+        is_pure_python = False
+        
+        if "abi3" in wheel_types:
+            flags.append("Contains ABI3 wheels (stabilized C-API, compiled code)")
+            confidence += 4
+        elif "cpython-abi" in wheel_types:
+            flags.append("Contains CPython-specific ABI wheels (version-specific compiled code)")
+            confidence += 4
+        elif "platform-specific" in wheel_types:
+            flags.append("Contains platform-specific wheels (likely compiled code)")
+            confidence += 3
+        else:
+            flags.append("Non-pure Python wheel (likely contains compiled code)")
+            confidence += 3
+    
+    # If pure Python is explicitly mentioned in classifiers, decrease confidence
+    if any("Pure Python" in c for c in classifiers):
+        confidence -= 3
+        is_pure_python = True
+    
+    # Check description and summary but require strong evidence
+    # Fix: Make sure description and summary are not None before using lower()
+    description = info.get("description", "") or ""
+    if not isinstance(description, str):
+        description = ""
+    else:
+        description = description.lower()
+        
+    summary = info.get("summary", "") or ""
+    if not isinstance(summary, str):
+        summary = ""
+    else:
+        summary = summary.lower()
+    
+    # Strong indicators in text that definitely suggest native deps
+    strong_indicators = [
+        "c extension", "native extension", "rust extension", 
+        "compiled extension", "wrapper around the c library", 
+        "bindings for the c library", "rust implementation",
+        "cython implementation", "binary module"
+    ]
+    
+    # Check for the strongest indicators
+    for indicator in strong_indicators:
+        if indicator in description or indicator in summary:
+            flags.append(f"Documentation explicitly mentions native code: '{indicator}'")
+            confidence += 2
+    
+    # Only return flags if our confidence is high enough
+    # This filters out packages that only have weak signals
+    if confidence >= 3:
+        return flags
+    else:
+        return []
+
 def show_spinner():
     """Display a spinner with package count to indicate progress."""
     global spinner_active, processed_count
@@ -96,7 +260,7 @@ def extract_license_info(package_data):
 
 def get_pypi_metadata(package, verbose=False, parent=None, fetch_license=False):
     """Fetch metadata for a package from PyPI with caching."""
-    global metadata_cache, missing_packages, license_info
+    global metadata_cache, missing_packages, license_info, investigation_flags
     
     # Use cached response if available
     if package in metadata_cache:
@@ -107,6 +271,12 @@ def get_pypi_metadata(package, verbose=False, parent=None, fetch_license=False):
         if fetch_license and package not in license_info:
             license_info[package] = extract_license_info(metadata_cache[package])
             
+        # Always check for investigation flags
+        if package not in investigation_flags:
+            flags = needs_investigation(metadata_cache[package])
+            if flags:
+                investigation_flags[package] = flags
+                
         return metadata_cache[package]
     
     if verbose:
@@ -124,6 +294,11 @@ def get_pypi_metadata(package, verbose=False, parent=None, fetch_license=False):
         # Extract license information if requested
         if fetch_license:
             license_info[package] = extract_license_info(data)
+            
+        # Always check if package needs investigation
+        flags = needs_investigation(data)
+        if flags:
+            investigation_flags[package] = flags
             
         return data
     except requests.HTTPError as e:
@@ -340,7 +515,7 @@ def build_dependency_tree(root_package, max_depth=float('inf'), verbose=False, i
         
     return dict(tree), package_depths
 
-def print_dependency_tree(tree, root_package, indent=0, visited=None, show_license=False):
+def print_dependency_tree(tree, root_package, indent=0, visited=None, show_license=False, show_investigation=True):
     """Recursive printing to show the hierarchy in a 'pretty' format."""
     if visited is None:
         visited = set()
@@ -348,18 +523,32 @@ def print_dependency_tree(tree, root_package, indent=0, visited=None, show_licen
     clean_package = parse_requirement(root_package)
     prefix = "  " * indent
     
+    # Build the output string with package name
+    output = f"{prefix}- {root_package}"
+    
+    # Add license information if available
     if show_license and clean_package in license_info:
         license_text = license_info[clean_package]["license"]
-        print(f"{prefix}- {root_package} [{license_text}]")
-    else:
-        print(f"{prefix}- {root_package}")
+        output += f" [{license_text}]"
+    
+    # Add investigation flags indicator if available
+    if show_investigation and clean_package in investigation_flags:
+        output += " (!)"  # Simple flag indicator
+    
+    print(output)
+    
+    # If package has investigation flags, print them at an increased indent
+    if show_investigation and clean_package in investigation_flags:
+        flag_prefix = "  " * (indent + 1)
+        for flag in investigation_flags[clean_package]:
+            print(f"{flag_prefix}! {flag}")
         
     visited.add(clean_package)
 
     for dep in tree.get(clean_package, []):
         clean_dep = parse_requirement(dep)
         if clean_dep not in visited:
-            print_dependency_tree(tree, dep, indent + 1, visited, show_license)
+            print_dependency_tree(tree, dep, indent + 1, visited, show_license, show_investigation)
 
 def print_missing_packages_report():
     """Print a report of all missing packages."""
@@ -435,7 +624,11 @@ def print_dependency_report(tree, package_depths, root_package, show_license=Fal
         for dep in deps:
             all_packages.add(parse_requirement(dep))
     
-    # Remove the root package
+    # Make a copy of all packages including root for analysis
+    all_packages_with_root = all_packages.copy()
+    all_packages_with_root.add(clean_root)
+    
+    # Remove the root package from dependency count
     if clean_root in all_packages:
         all_packages.remove(clean_root)
     
@@ -445,12 +638,102 @@ def print_dependency_report(tree, package_depths, root_package, show_license=Fal
     # Count dependencies by depth
     depth_counts = Counter(package_depths.values())
     
+    # Count packages requiring investigation - be sure to include root package if it needs investigation
+    investigation_count = sum(1 for pkg in all_packages if pkg in investigation_flags)
+    # Add root package to count if it needs investigation
+    if clean_root in investigation_flags:
+        investigation_count += 1
+    
+    # Helper function to get wheel type info for packages
+    def get_wheel_info(package):
+        data = metadata_cache.get(package)
+        if not data:
+            return None
+            
+        wheel_info = {
+            "has_wheels": False,
+            "wheel_types": [],
+            "is_pure_python": True
+        }
+        
+        release_info = data.get("urls", []) or []
+        
+        for release in release_info:
+            filename = release.get("filename", "").lower()
+            
+            if filename.endswith(".whl"):
+                wheel_info["has_wheels"] = True
+                
+                try:
+                    # Parse wheel filename components
+                    wheel_parts = filename[:-4].split('-')
+                    if len(wheel_parts) >= 3:
+                        # Last three components are python tag, abi tag, platform tag
+                        python_tag = wheel_parts[-3]
+                        abi_tag = wheel_parts[-2]
+                        platform_tag = wheel_parts[-1]
+                        
+                        # Pure Python wheels
+                        if abi_tag == 'none' and platform_tag == 'any':
+                            if "pure-python" not in wheel_info["wheel_types"]:
+                                wheel_info["wheel_types"].append("pure-python")
+                        # ABI3 wheels
+                        elif 'abi3' in abi_tag:
+                            if "abi3" not in wheel_info["wheel_types"]:
+                                wheel_info["wheel_types"].append("abi3")
+                                wheel_info["is_pure_python"] = False
+                        # CPython specific ABI wheels
+                        elif python_tag.startswith('cp') and abi_tag.startswith('cp'):
+                            if "cpython-abi" not in wheel_info["wheel_types"]:
+                                wheel_info["wheel_types"].append("cpython-abi")
+                                wheel_info["is_pure_python"] = False
+                        # Other platform-specific wheels
+                        elif platform_tag != 'any':
+                            if "platform-specific" not in wheel_info["wheel_types"]:
+                                wheel_info["wheel_types"].append("platform-specific")
+                                wheel_info["is_pure_python"] = False
+                except:
+                    pass
+                    
+            # Check for C extension module markers in filenames
+            if any(ext in filename for ext in [".so", ".pyd", ".dll"]):
+                wheel_info["is_pure_python"] = False
+                if "contains-extension-modules" not in wheel_info["wheel_types"]:
+                    wheel_info["wheel_types"].append("contains-extension-modules")
+        
+        return wheel_info
+    
+    # Analyze wheel types
+    wheel_type_counts = {
+        "pure-python": 0,
+        "abi3": 0,
+        "cpython-abi": 0, 
+        "platform-specific": 0,
+        "contains-extension-modules": 0
+    }
+    
+    # Count wheel types for all packages including root
+    for pkg in all_packages_with_root:
+        wheel_info = get_wheel_info(pkg)
+        if wheel_info:
+            for wheel_type in wheel_info["wheel_types"]:
+                if wheel_type in wheel_type_counts:
+                    wheel_type_counts[wheel_type] += 1
+    
     # Print the report
     print(f"\nDEPENDENCY REPORT FOR {root_package}")
     print(f"================================{'=' * len(root_package)}")
     print(f"Total unique dependencies: {len(all_packages)}")
     print(f"Direct dependencies: {len(direct_deps)}")
     print(f"Max dependency depth: {max(package_depths.values()) if package_depths else 0}")
+    print(f"Packages requiring investigation: {investigation_count}")
+    
+    # Print wheel type summary
+    print("\nWheel type distribution:")
+    for wheel_type, count in wheel_type_counts.items():
+        if count > 0:
+            print(f"  {wheel_type}: {count} packages")
+    
     print("\nDependencies by depth:")
     for depth in sorted(depth_counts.keys()):
         if depth == 0:  # Skip root
@@ -480,12 +763,30 @@ def print_dependency_report(tree, package_depths, root_package, show_license=Fal
             if full_spec:
                 break
         
-        # Print package with license info if requested
+        # Start with the package name and spec
+        output = f"  {full_spec or pkg}"
+        
+        # Add license info if available
         if show_license and pkg in license_info:
             license_text = license_info[pkg]["license"]
-            print(f"  {full_spec or pkg} [{license_text}]")
-        else:
-            print(f"  {full_spec or pkg}")
+            output += f" [{license_text}]"
+            
+        # Add wheel type if available
+        wheel_info = get_wheel_info(pkg)
+        if wheel_info and wheel_info["wheel_types"]:
+            wheel_types_text = ", ".join(wheel_info["wheel_types"])
+            output += f" (wheels: {wheel_types_text})"
+            
+        # Add investigation flag indicator if needed
+        if pkg in investigation_flags:
+            output += " (!)"
+            
+        print(output)
+        
+        # If package has investigation flags, print them indented
+        if pkg in investigation_flags:
+            for flag in investigation_flags[pkg]:
+                print(f"    ! {flag}")
     
     # Print missing packages report if any
     print_missing_packages_report()
@@ -493,6 +794,22 @@ def print_dependency_report(tree, package_depths, root_package, show_license=Fal
     # Print license report if requested
     if show_license:
         print_license_report()
+        
+    # Print investigation flags report if any
+    if investigation_flags:
+        print("\nPACKAGES REQUIRING FURTHER INVESTIGATION")
+        print("=======================================")
+        print(f"Total packages flagged: {investigation_count}")
+        
+        for pkg, flags in sorted(investigation_flags.items()):
+            # Skip packages that aren't the root or in our dependency tree
+            if pkg != clean_root and pkg not in all_packages:
+                continue
+                
+            print(f"\n- {pkg}")
+            for flag in flags:
+                print(f"  • {flag}")
+            print(f"  Recommendation: Verify system requirements and build environment")
 
 def create_json_output(tree, package_depths, root_package):
     """
@@ -506,6 +823,65 @@ def create_json_output(tree, package_depths, root_package):
         all_packages.add(pkg)
         for dep in deps:
             all_packages.add(parse_requirement(dep))
+            
+    # Helper function to get wheel information for a package
+    def get_wheel_info(package):
+        data = metadata_cache.get(package)
+        if not data:
+            return {}
+            
+        wheel_info = {
+            "has_wheels": False,
+            "wheel_types": [],
+            "is_pure_python": True
+        }
+        
+        release_info = data.get("urls", []) or []
+        
+        for release in release_info:
+            filename = release.get("filename", "").lower()
+            
+            if filename.endswith(".whl"):
+                wheel_info["has_wheels"] = True
+                
+                try:
+                    # Parse wheel filename components
+                    wheel_parts = filename[:-4].split('-')
+                    if len(wheel_parts) >= 3:
+                        # Last three components are python tag, abi tag, platform tag
+                        python_tag = wheel_parts[-3]
+                        abi_tag = wheel_parts[-2]
+                        platform_tag = wheel_parts[-1]
+                        
+                        wheel_type = None
+                        # Pure Python wheels
+                        if abi_tag == 'none' and platform_tag == 'any':
+                            wheel_type = "pure-python"
+                        # ABI3 wheels
+                        elif 'abi3' in abi_tag:
+                            wheel_type = "abi3"
+                            wheel_info["is_pure_python"] = False
+                        # CPython specific ABI wheels
+                        elif python_tag.startswith('cp') and abi_tag.startswith('cp'):
+                            wheel_type = "cpython-abi"
+                            wheel_info["is_pure_python"] = False
+                        # Other platform-specific wheels
+                        elif platform_tag != 'any':
+                            wheel_type = "platform-specific"
+                            wheel_info["is_pure_python"] = False
+                            
+                        if wheel_type and wheel_type not in wheel_info["wheel_types"]:
+                            wheel_info["wheel_types"].append(wheel_type)
+                except:
+                    pass
+                    
+            # Check for C extension module markers in filenames
+            if any(ext in filename for ext in [".so", ".pyd", ".dll"]):
+                wheel_info["is_pure_python"] = False
+                if "contains-extension-modules" not in wheel_info["wheel_types"]:
+                    wheel_info["wheel_types"].append("contains-extension-modules")
+        
+        return wheel_info
     
     # Create a list of all dependencies with their details
     dependencies = []
@@ -532,6 +908,11 @@ def create_json_output(tree, package_depths, root_package):
             "direct_parents": direct_parents
         }
         
+        # Get wheel information
+        wheel_info = get_wheel_info(pkg)
+        if wheel_info:
+            dep_info.update(wheel_info)
+        
         # Add license information if available
         if pkg in license_info:
             dep_info["license"] = license_info[pkg]["license"]
@@ -543,6 +924,14 @@ def create_json_output(tree, package_depths, root_package):
                 dep_info["author"] = license_info[pkg]["author"]
                 if license_info[pkg]["author_email"]:
                     dep_info["author_email"] = license_info[pkg]["author_email"]
+        
+        # Add investigation flags if available
+        if pkg in investigation_flags:
+            dep_info["investigation_required"] = True
+            dep_info["investigation_flags"] = investigation_flags[pkg]
+            dep_info["recommendation"] = "Verify system requirements and build environment"
+        else:
+            dep_info["investigation_required"] = False
         
         dependencies.append(dep_info)
     
@@ -561,7 +950,8 @@ def create_json_output(tree, package_depths, root_package):
         "summary": {
             "total_dependencies": len(dependencies),
             "max_depth": max(package_depths.values()) if package_depths else 0,
-            "missing_packages": len(missing)
+            "missing_packages": len(missing),
+            "packages_requiring_investigation": len(investigation_flags)
         },
         "dependencies": dependencies,
         "missing_packages": missing
@@ -578,6 +968,23 @@ def create_json_output(tree, package_depths, root_package):
             "packages_with_license_info": len(license_info),
             "license_distribution": license_counts
         }
+    
+    # Add wheel type summary
+    wheel_type_counts = {
+        "pure-python": 0,
+        "abi3": 0,
+        "cpython-abi": 0,
+        "platform-specific": 0,
+        "contains-extension-modules": 0
+    }
+    
+    for dep in dependencies:
+        for wheel_type in dep.get("wheel_types", []):
+            if wheel_type in wheel_type_counts:
+                wheel_type_counts[wheel_type] += 1
+    
+    # Only include non-zero counts
+    json_data["wheel_summary"] = {k: v for k, v in wheel_type_counts.items() if v > 0}
     
     return json_data
 
@@ -598,6 +1005,8 @@ def main():
                        help="Show report of missing packages")
     parser.add_argument("--license", "-l", action="store_true",
                        help="Include license information for each package")
+    parser.add_argument("--investigation", "-i", action="store_true",
+                       help="Flag packages that may require further investigation (e.g., FFI, system dependencies)")
     parser.add_argument("--json", "-j", action="store_true",
                        help="Output results in JSON format")
     parser.add_argument("--output", "-o", type=str, 
@@ -606,6 +1015,9 @@ def main():
     
     # Use either max_depth or infinity
     max_depth = args.max_depth if args.max_depth is not None else float('inf')
+    
+    # Always gather metadata fully for license and investigation
+    fetch_metadata = True
 
     tree, package_depths = build_dependency_tree(
         args.package, 
@@ -613,7 +1025,7 @@ def main():
         args.verbose,
         include_conditional=args.all_deps,
         include_dev=args.include_dev,
-        fetch_license=args.license
+        fetch_license=fetch_metadata  # Always fetch full metadata to support all features
     )
     
     # Handle JSON output
@@ -636,7 +1048,8 @@ def main():
             sys.stdout = open(args.output, 'w')
         
         # Always print the tree unless JSON was requested
-        print_dependency_tree(tree, args.package, show_license=args.license)
+        # Only show investigation details in tree if specifically requested
+        print_dependency_tree(tree, args.package, show_license=args.license, show_investigation=args.investigation)
         
         # Optionally print the report
         if args.report:
@@ -647,6 +1060,21 @@ def main():
             # Print license report if --license is specified but not --report
             # (as --report already includes the license report)
             print_license_report()
+        elif args.investigation and not args.report:
+            # Print investigation report if --investigation is specified but not --report
+            # (as --report already includes the investigation report)
+            if investigation_flags:
+                print("\nPACKAGES REQUIRING FURTHER INVESTIGATION")
+                print("=======================================")
+                print(f"Total packages flagged: {len(investigation_flags)}")
+                
+                for pkg, flags in sorted(investigation_flags.items()):
+                    print(f"\n- {pkg}")
+                    for flag in flags:
+                        print(f"  • {flag}")
+                    print(f"  Recommendation: Verify system requirements and build environment")
+            else:
+                print("\nNo packages requiring further investigation were found.")
             
         # Reset stdout if it was redirected
         if args.output and not args.json:
